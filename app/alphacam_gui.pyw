@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import os
 import queue
+import re
 import threading
 import traceback
 from dataclasses import dataclass
@@ -24,7 +25,16 @@ from tkinter import filedialog, messagebox, ttk
 DEFAULT_PROGID = "Broutaps.Application"
 DEFAULT_AUTOSTYLE = r"C:\ALPHACAM1\LICOMDIR\Styles\DRILL\AUTODRILL.ara"
 DEFAULT_TEMPLATE = r"C:\ALPHACAM1\LICOMDIR\Templates\DEFAULT-PAZ.adt"
+DEFAULT_POST = r"C:\Alphacam1\LICOMDAT\RPosts.Alp\Biesse Rover 22v4.10-PR.arp"
+# Alphacam API: 0 = file, 1 = machine, 2 = both.
+# Keep this aligned with ExportCode.bas: D.OutputNC(sName, 0, 1).
 NC_OUTPUT_MODE = 0
+SIMPLE_BOX_MAX_BYTES = 12000
+ORIENTATION_DIALOG_GEOMETRY = (
+    Path(os.environ.get("APPDATA", Path.home()))
+    / "AutoCAM"
+    / "orientation_dialog_geometry.txt"
+)
 
 
 class ProcessingError(RuntimeError):
@@ -36,6 +46,26 @@ class StageResult:
     stage: str
     message: str
     details: dict[str, Any]
+
+
+def quick_xt_candidate(path: Path) -> tuple[bool, str]:
+    """Быстрый предварительный фильтр XT, не доказывающий геометрию."""
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        return False, f"не удалось прочитать размер: {exc}"
+    if size > SIMPLE_BOX_MAX_BYTES:
+        return False, f"файл крупный ({size} байт), требуется полная проверка"
+    try:
+        header = path.read_bytes()[:65536].decode("latin-1", errors="ignore")
+    except OSError as exc:
+        return False, f"не удалось прочитать XT: {exc}"
+    upper = header.upper()
+    if "PARASOLID" not in upper or "FORMAT=TEXT" not in upper:
+        return False, "не подтверждён текстовый Parasolid"
+    if "**END_OF_HEADER" not in upper:
+        return False, "неполный заголовок Parasolid"
+    return True, f"кандидат по заголовку и размеру ({size} байт)"
 
 
 def normalize_wp_name(value: str) -> str:
@@ -246,6 +276,22 @@ class AlphacamProcessor:
             f"Не удалось записать параметр Alphacam {name!r}. "
             + " | ".join(errors)
         )
+
+    def disable_groove(self, drawing: Any) -> None:
+        """Отключить паз в производной программе (например, -ROT)."""
+        try:
+            algebra = drawing.ParametricInterface.ActiveAlgebra
+            try:
+                algebra.Parameter("GrooveEnable")
+            except Exception:
+                self.log.info("Параметр GrooveEnable отсутствует — паз в исходном ARD не задан")
+                return
+            self.set_algebra_parameter(algebra, "GrooveEnable", 0)
+            self.log.info("Паз отключён для производной программы")
+        except Exception as exc:
+            raise ProcessingError(
+                f"Не удалось отключить паз в производной программе: {exc}"
+            ) from exc
 
     def workplanes(self, drawing: Any) -> list[Any]:
         collection = drawing.WorkPlanes
@@ -496,6 +542,100 @@ class AlphacamProcessor:
         self.app.OpenExternalFile(str(source_path.resolve()), "Parasolid", False)
         return self.session.active_drawing()
 
+    @staticmethod
+    def _com_collection_count(owner: Any, *names: str) -> int | None:
+        for name in names:
+            try:
+                value = getattr(owner, name)
+                if callable(value):
+                    value = value()
+                return int(value.Count)
+            except Exception:
+                continue
+        return None
+
+    @staticmethod
+    def _com_object_text(value: Any) -> str:
+        chunks: list[str] = []
+        for name in ("Name", "Type", "SurfaceType", "CurveType", "Properties"):
+            try:
+                item = getattr(value, name)
+                if callable(item):
+                    item = item()
+                chunks.append(str(item))
+            except Exception:
+                continue
+        return " ".join(chunks).upper()
+
+    def inspect_simple_box(self, source_path: Path, drawing: Any) -> tuple[bool, str]:
+        """Проверить, является ли импортированная модель простым параллелепипедом.
+
+        Размер файла здесь только предварительный фильтр. Решение принимается
+        по топологии уже импортированного тела Alphacam.
+        """
+        candidate, reason = quick_xt_candidate(source_path)
+        if not candidate:
+            return False, reason
+
+        try:
+            bodies = drawing.SolidInterface.BodiesInDrawing(drawing)
+            body_count = int(bodies.Count)
+            if body_count != 1:
+                return False, f"тел: {body_count}, ожидалось 1"
+            body = bodies.Item(1)
+        except Exception as exc:
+            return False, f"не удалось получить solid body: {exc}"
+
+        counts = {
+            "shells": self._com_collection_count(body, "Shells", "SolidShells"),
+            "lumps": self._com_collection_count(body, "Lumps", "SolidLumps"),
+            "faces": self._com_collection_count(body, "Faces", "SolidFaces"),
+            "edges": self._com_collection_count(body, "Edges", "SolidEdges"),
+            "vertices": self._com_collection_count(body, "Vertices", "SolidVertices"),
+        }
+        required = ("shells", "faces", "edges", "vertices")
+        missing = [name for name in required if counts[name] is None]
+        if missing:
+            return False, f"COM не предоставил топологию: {', '.join(missing)}"
+        if counts["shells"] != 1:
+            return False, f"оболочек: {counts['shells']}, ожидалась 1"
+        if counts["lumps"] is not None and counts["lumps"] != 1:
+            return False, f"lumps: {counts['lumps']}, ожидался 1"
+        expected = {"faces": 6, "edges": 12, "vertices": 8}
+        wrong = [
+            f"{name}={counts[name]} (ожидалось {value})"
+            for name, value in expected.items()
+            if counts[name] != value
+        ]
+        if wrong:
+            return False, "топология не параллелепипеда: " + ", ".join(wrong)
+
+        complex_tokens = (
+            "CYLINDER", "CYLINDR", "SPHERE", "TORUS", "CONE", "SPLINE",
+            "NURBS", "BSURF", "BEZIER", "CIRCLE", "ARC", "ELLIPSE",
+        )
+        complex_objects: list[str] = []
+        for collection_name in ("Faces", "Edges", "Vertices"):
+            try:
+                collection = getattr(body, collection_name)
+                count = int(collection.Count)
+                for index in range(1, count + 1):
+                    text = self._com_object_text(collection.Item(index))
+                    found = [token for token in complex_tokens if token in text]
+                    if found:
+                        complex_objects.extend(found)
+            except Exception:
+                # Топологические количества уже проверены; конкретные типы
+                # могут быть недоступны в старых COM-библиотеках.
+                continue
+        if complex_objects:
+            return False, "найдены сложные элементы: " + ", ".join(sorted(set(complex_objects)))
+
+        return True, (
+            "простой параллелепипед: 1 body, 1 shell, "
+            "6 faces, 12 edges, 8 vertices; сложные элементы не найдены"
+        )
+
     def capture_groove_via_vba(self, drawing: Any) -> None:
         """Дать оператору выбрать грань паза и сохранить параметры в ARD."""
         project = os.environ.get("ALPHACAM_VBA_PROJECT", "DWFI_PR").strip()
@@ -624,8 +764,8 @@ class AlphacamProcessor:
             float(body.MinZ), float(body.MaxZ),
         )
 
-    def rotate_180_x_and_normalize(self, drawing: Any) -> None:
-        """Поворот для -OBR: X+, Y-, Z+ относительно начала координат."""
+    def rotate_180_y_and_normalize(self, drawing: Any) -> None:
+        """Повернуть -OBR вокруг оси Y и вернуть деталь к началу координат."""
         body = self.get_solid(drawing)
         center_x = (float(body.MinX) + float(body.MaxX)) / 2.0
         center_y = (float(body.MinY) + float(body.MaxY)) / 2.0
@@ -635,12 +775,13 @@ class AlphacamProcessor:
             center_x,
             center_y,
             center_z,
-            center_x + 1.0,
-            center_y,
+            center_x,
+            center_y + 1.0,
             center_z,
         )
 
-        # MinX=0, MaxY=0, MinZ=0 -> X положительный, Y отрицательный, Z положительный.
+        # Целевое положение -OBR: X+, Y-, Z+. Поэтому к нулю привязываем
+        # MinX, MaxY и MinZ соответственно.
         body.MoveG(-float(body.MinX), -float(body.MaxY), -float(body.MinZ))
         drawing.RedrawShadedViews()
 
@@ -652,13 +793,85 @@ class AlphacamProcessor:
             drawing.RedrawShadedViews()
 
         self.log.info(
-            "OBR после поворота X: X[%.6f..%.6f] Y[%.6f..%.6f] Z[%.6f..%.6f]",
+            "OBR после поворота Y: X[%.6f..%.6f] Y[%.6f..%.6f] Z[%.6f..%.6f]",
             float(body.MinX), float(body.MaxX),
             float(body.MinY), float(body.MaxY),
             float(body.MinZ), float(body.MaxZ),
         )
 
+    def _set_post_user_variable(self, name: str, value: int) -> None:
+        """Передать переменную в выбранный постпроцессор (как App.SetPostUserVariable)."""
+        try:
+            self.app.SetPostUserVariable(name, int(value))
+        except Exception as exc:
+            raise ProcessingError(
+                f"Не удалось передать постпроцессору переменную {name!r}: {exc}"
+            ) from exc
+
+    def _prepare_post_variables(self, drawing: Any) -> None:
+        """Повторяет подготовку постпроцессора из ExportCode.bas перед OutputNC."""
+        post_path = Path(os.environ.get("ALPHACAM_POST", DEFAULT_POST))
+        if not post_path.is_file():
+            raise ProcessingError(f"Постпроцессор не найден: {post_path}")
+
+        try:
+            self.app.SelectPost(str(post_path))
+            algebra = drawing.ParametricInterface.ActiveAlgebra
+            width = float(algebra.Parameter("Width"))
+            height = float(algebra.Parameter("Height"))
+            thickness = float(algebra.Parameter("Thickness"))
+        except Exception as exc:
+            raise ProcessingError(
+                f"Не удалось подготовить параметры постпроцессора: {exc}"
+            ) from exc
+
+        if width == 0 and height == 0 and thickness == 0:
+            raise ProcessingError("Габариты детали не определены.")
+
+        self._set_post_user_variable("PANEL_X", round(width * 1000))
+        self._set_post_user_variable("PANEL_Y", round(height * 1000))
+        self._set_post_user_variable("PANEL_Z", round(thickness * 1000))
+        self._set_post_user_variable("PCSG_Z", 0)
+        self._set_post_user_variable("PUOS", 0)
+
+        # Параметры паза сохраняются в ARD модулем GrooveStorage.bas.
+        # Если в шаблоне их нет, экспортируем состояние "паза нет",
+        # как LoadGrooveFromARD в VBA.
+        try:
+            groove_enabled = int(algebra.Parameter("GrooveEnable"))
+        except Exception:
+            groove_enabled = 0
+
+        self._set_post_user_variable("GROOVE_ENABLE", 1 if groove_enabled else 0)
+        if groove_enabled:
+            groove_params = (
+                ("ZPAZ", "GrooveDepth"),
+                ("USER_DXPAZ", "GrooveDX"),
+                ("LPAZ", "GrooveLength"),
+                ("WPAZ", "GrooveWidth"),
+                ("YPAZ", "GrooveY"),
+            )
+            try:
+                for post_name, ard_name in groove_params:
+                    self._set_post_user_variable(
+                        post_name, round(float(algebra.Parameter(ard_name)) * 1000)
+                    )
+            except Exception as exc:
+                raise ProcessingError(
+                    f"Не удалось прочитать параметры паза из ARD: {exc}"
+                ) from exc
+
+        self.log.info(
+            "Постпроцессор подготовлен: %s; PANEL_X=%d PANEL_Y=%d PANEL_Z=%d; groove=%d",
+            post_path,
+            round(width * 1000),
+            round(height * 1000),
+            round(thickness * 1000),
+            1 if groove_enabled else 0,
+        )
+
     def export_nc(self, drawing: Any, destination: Path) -> None:
+        self._prepare_post_variables(drawing)
         drawing.OutputNC(str(destination.resolve()), NC_OUTPUT_MODE, True)
         if not destination.is_file():
             raise ProcessingError(f"NC-файл не создан: {destination}")
@@ -680,6 +893,9 @@ class AlphacamProcessor:
         self.rotate_180_z_and_normalize(drawing)
         dimensions = self.solid_body_dimensions(drawing)
         self.set_drawing_parameters(drawing, dimensions)
+        # Паз относится только к основной программе. Копия -ROT должна
+        # обрабатываться без параметров паза, даже если они есть в исходном ARD.
+        self.disable_groove(drawing)
 
         side4 = self.extract_workplanes(drawing, target_side=4)
         created = sum(int(item["created"]) for item in side4)
@@ -707,7 +923,7 @@ class AlphacamProcessor:
         export_nc: bool,
         require_features: bool = False,
     ) -> StageResult:
-        """Создать -OBR, повернуть вокруг X и обработать обратную сторону."""
+        """Создать -OBR, повернуть вокруг Y и обработать обратную сторону."""
         obr_path = source_path.with_name(f"{source_path.stem}-OBR{source_path.suffix}")
         if obr_path.exists():
             raise ProcessingError(f"OBR-файл уже существует: {obr_path}")
@@ -715,14 +931,14 @@ class AlphacamProcessor:
         drawing = self.open_drawing(source_path)
         self.save_as(drawing, obr_path)
         drawing = self.session.active_drawing()
-        self.rotate_180_x_and_normalize(drawing)
+        self.rotate_180_y_and_normalize(drawing)
         dimensions = self.solid_body_dimensions(drawing)
         self.set_drawing_parameters(drawing, dimensions)
 
         obr_workplanes = self.extract_workplanes(drawing, exclude_side=2)
         created = sum(int(item["created"]) for item in obr_workplanes)
         if require_features and created <= 0:
-            raise ProcessingError("После поворота на X не найдены геометрии для OBR.")
+            raise ProcessingError("После поворота на Y не найдены геометрии для OBR.")
 
         self.apply_autostyle(autostyle_path)
         drawing.SaveAs(str(obr_path.resolve()))
@@ -808,7 +1024,7 @@ class App(tk.Tk):
         self.worker: threading.Thread | None = None
         self.ard_var = tk.StringVar()
         self.autostyle_var = tk.StringVar(value=DEFAULT_AUTOSTYLE)
-        self.export_var = tk.BooleanVar(value=False)
+        self.export_var = tk.BooleanVar(value=True)
         self.progid_var = tk.StringVar(value=os.environ.get("ALPHACAM_PROGID", DEFAULT_PROGID))
         self._build_ui()
         self.after(100, self._drain_log)
@@ -971,36 +1187,59 @@ class App(tk.Tk):
             processor = AlphacamProcessor(session)
             for index, x_path in enumerate(x_files, start=1):
                 drawing = processor.import_x_t(x_path, Path(template))
+                simple_box, box_reason = processor.inspect_simple_box(x_path, drawing)
+                if simple_box:
+                    logger.info(
+                        "%s: автоматически установлен пропуск обработки — %s",
+                        x_path.name,
+                        box_reason,
+                    )
+                else:
+                    logger.info(
+                        "%s: автоматический пропуск не установлен — %s",
+                        x_path.name,
+                        box_reason,
+                    )
                 settings = self._show_orientation_dialog(
-                    processor, drawing, x_path.name, index, len(x_files)
+                    processor,
+                    drawing,
+                    x_path.name,
+                    index,
+                    len(x_files),
+                    default_skip=simple_box,
                 )
                 if settings is None:
                     logger.info("Подготовка отменена на %s", x_path.name)
                     break
 
                 ard_path = output / f"{x_path.stem}.ard"
+                dop_path = output / f"{x_path.stem}-DOP.ard"
                 if settings["skip"]:
                     logger.info("%s: обработка пропущена, ARD не создаётся", x_path.name)
                 else:
                     processor.save_as(drawing, ard_path)
+                    if settings["dop"]:
+                        processor.save_as(drawing, dop_path)
+                        logger.info("Дополнительная копия без обработки: %s", dop_path.name)
                 plan_rows.append(
                     f"{ard_path.name}|{int(settings['groove'])}|"
                     f"{int(settings['reverse'])}|{int(settings['rotate_program'])}|"
-                    f"{int(settings['skip'])}"
+                    f"{int(settings['skip'])}|{int(settings['dop'])}"
                 )
                 logger.info(
                     "Подготовлен %s: паз=%s, обратная сторона=%s, "
-                    "ROT=%s, пропуск=%s",
+                    "ROT=%s, пропуск=%s, DOP=%s",
                     ard_path.name,
                     "да" if settings["groove"] else "нет",
                     "да" if settings["reverse"] else "нет",
                     "да" if settings["rotate_program"] else "нет",
                     "да" if settings["skip"] else "нет",
+                    "да" if settings["dop"] else "нет",
                 )
 
             plan_path.write_text(
-                "# AutoCAM batch plan v1\n"
-                "# file|groove|reverse|rotate_program|skip\n"
+                "# AutoCAM batch plan v2\n"
+                "# file|groove|reverse|rotate_program|skip|dop\n"
                 + "\n".join(plan_rows),
                 encoding="utf-8",
             )
@@ -1027,9 +1266,6 @@ class App(tk.Tk):
     def _process_batch_plan(self, plan_path: Path) -> None:
         """Вторая фаза: обновить ARD, затем выбрать паз и обработать файл."""
         autostyle_path = Path(self.autostyle_var.get().strip())
-        if not autostyle_path.is_file():
-            messagebox.showerror("Ошибка", "Укажите существующий файл AutoStyle.")
-            return
 
         logger = logging.getLogger(f"alphacam_gui.plan.{id(self)}")
         logger.setLevel(logging.INFO)
@@ -1057,6 +1293,7 @@ class App(tk.Tk):
                 reverse_side = parts[2] == "1"
                 rotate_program = len(parts) > 3 and parts[3] == "1"
                 skip = len(parts) > 4 and parts[4] == "1"
+                dop = len(parts) > 5 and parts[5] == "1"
                 if skip:
                     logger.info("%s: пропущен по плану, ARD не создавался", parts[0])
                     continue
@@ -1064,19 +1301,29 @@ class App(tk.Tk):
                     logger.error("ARD из плана не найден: %s", ard_path)
                     continue
 
+                if dop:
+                    dop_path = ard_path.with_name(f"{ard_path.stem}-DOP{ard_path.suffix}")
+                    if dop_path.is_file():
+                        logger.info(
+                            "%s: дополнительная DOP-копия сохранена без AutoStyle",
+                            dop_path.name,
+                        )
+
+                if not autostyle_path.is_file():
+                    raise ProcessingError(
+                        "Укажите существующий файл AutoStyle для обычной обработки."
+                    )
+
                 drawing = processor.open_drawing(ard_path)
                 dimensions = processor.solid_dimensions(drawing)
                 processor.set_drawing_parameters(drawing, dimensions)
 
                 if has_groove:
-                    messagebox.showinfo(
-                        "Выбор паза",
-                        f"Деталь: {ard_path.name}\n\n"
-                        "Параметры чертежа уже обновлены.\n"
-                        "Теперь выберите грань/геометрию паза в Alphacam.",
-                        parent=self,
-                    )
-                    processor.capture_groove_via_vba(drawing)
+                    prompt = self._show_groove_prompt(ard_path.name)
+                    try:
+                        processor.capture_groove_via_vba(drawing)
+                    finally:
+                        prompt.destroy()
                     drawing.SaveAs(str(ard_path.resolve()))
                 else:
                     logger.info("%s: паз не требуется", ard_path.name)
@@ -1113,19 +1360,25 @@ class App(tk.Tk):
         filename: str,
         index: int,
         total: int,
+        default_skip: bool = False,
     ) -> dict[str, Any] | None:
         dialog = tk.Toplevel(self)
         dialog.title(f"Настройка детали {index} из {total}")
         dialog.transient(self)
         dialog.grab_set()
         dialog.resizable(False, False)
+        dialog.attributes("-topmost", True)
+        self._restore_orientation_dialog_geometry(dialog)
+        dialog.lift()
+        dialog.focus_force()
 
         rotation = [0]
         confirmed = [False]
         groove = tk.BooleanVar(value=False)
         reverse = tk.BooleanVar(value=False)
         rotate_program = tk.BooleanVar(value=False)
-        skip = tk.BooleanVar(value=False)
+        skip = tk.BooleanVar(value=default_skip)
+        dop = tk.BooleanVar(value=False)
 
         ttk.Label(dialog, text=filename, font=("", 11, "bold")).pack(padx=20, pady=(16, 4))
         ttk.Label(dialog, text="Измените положение детали в Alphacam, затем подтвердите.").pack(padx=20, pady=(0, 12))
@@ -1158,8 +1411,16 @@ class App(tk.Tk):
             text="Поворот (создать стандартную и *-ROT на 180°)",
             variable=rotate_program,
         ).pack(anchor="w", padx=24)
+        skip_text = "Пропускаем обработку (ARD не создаётся)"
+        if default_skip:
+            skip_text += " — простой параллелепипед определён автоматически"
+        ttk.Checkbutton(dialog, text=skip_text, variable=skip).pack(
+            anchor="w", padx=24
+        )
         ttk.Checkbutton(
-            dialog, text="Пропускаем обработку (ARD не создаётся)", variable=skip,
+            dialog,
+            text="Дополнительная обработка (создать только ARD с суффиксом -DOP)",
+            variable=dop,
         ).pack(anchor="w", padx=24)
 
         actions = ttk.Frame(dialog)
@@ -1167,11 +1428,12 @@ class App(tk.Tk):
 
         def accept() -> None:
             confirmed[0] = True
+            self._save_orientation_dialog_geometry(dialog)
             dialog.destroy()
 
         ttk.Button(actions, text="Подтвердить и сохранить", command=accept).pack(side=tk.LEFT, padx=4)
         ttk.Button(actions, text="Отмена", command=dialog.destroy).pack(side=tk.LEFT, padx=4)
-        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+        dialog.protocol("WM_DELETE_WINDOW", lambda: self._close_orientation_dialog(dialog))
         self.wait_window(dialog)
         if not confirmed[0]:
             return None
@@ -1181,7 +1443,46 @@ class App(tk.Tk):
             "reverse": reverse.get(),
             "rotate_program": rotate_program.get(),
             "skip": skip.get(),
+            "dop": dop.get(),
         }
+
+    def _restore_orientation_dialog_geometry(self, dialog: tk.Toplevel) -> None:
+        try:
+            geometry = ORIENTATION_DIALOG_GEOMETRY.read_text(encoding="ascii").strip()
+            if re.fullmatch(r"\d+x\d+[+-]\d+[+-]\d+", geometry):
+                dialog.geometry(geometry)
+        except (OSError, UnicodeError):
+            pass
+
+    def _save_orientation_dialog_geometry(self, dialog: tk.Toplevel) -> None:
+        try:
+            ORIENTATION_DIALOG_GEOMETRY.parent.mkdir(parents=True, exist_ok=True)
+            ORIENTATION_DIALOG_GEOMETRY.write_text(
+                dialog.wm_geometry(), encoding="ascii"
+            )
+        except OSError:
+            pass
+
+    def _close_orientation_dialog(self, dialog: tk.Toplevel) -> None:
+        self._save_orientation_dialog_geometry(dialog)
+        dialog.destroy()
+
+    def _show_groove_prompt(self, filename: str) -> tk.Toplevel:
+        prompt = tk.Toplevel(self)
+        prompt.title("Выбор паза")
+        prompt.transient(self)
+        prompt.resizable(False, False)
+        ttk.Label(
+            prompt,
+            text=(
+                f"Деталь: {filename}\n\n"
+                "Выберите грань/геометрию паза в Alphacam."
+            ),
+            justify="center",
+        ).pack(padx=24, pady=18)
+        prompt.protocol("WM_DELETE_WINDOW", lambda: None)
+        prompt.update_idletasks()
+        return prompt
 
     def _try_rotate(
         self,

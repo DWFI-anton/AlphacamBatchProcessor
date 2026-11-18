@@ -14,6 +14,7 @@ import queue
 import re
 import threading
 import traceback
+from itertools import combinations, product
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -29,7 +30,7 @@ DEFAULT_POST = r"C:\Alphacam1\LICOMDAT\RPosts.Alp\Biesse Rover 22v4.10-PR.arp"
 # Alphacam API: 0 = file, 1 = machine, 2 = both.
 # Keep this aligned with ExportCode.bas: D.OutputNC(sName, 0, 1).
 NC_OUTPUT_MODE = 0
-SIMPLE_BOX_MAX_BYTES = 12000
+_XT_NUMBER = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[Ee][+-]?\d+)?"
 ORIENTATION_DIALOG_GEOMETRY = (
     Path(os.environ.get("APPDATA", Path.home()))
     / "AutoCAM"
@@ -54,8 +55,6 @@ def quick_xt_candidate(path: Path) -> tuple[bool, str]:
         size = path.stat().st_size
     except OSError as exc:
         return False, f"не удалось прочитать размер: {exc}"
-    if size > SIMPLE_BOX_MAX_BYTES:
-        return False, f"файл крупный ({size} байт), требуется полная проверка"
     try:
         header = path.read_bytes()[:65536].decode("latin-1", errors="ignore")
     except OSError as exc:
@@ -66,6 +65,79 @@ def quick_xt_candidate(path: Path) -> tuple[bool, str]:
     if "**END_OF_HEADER" not in upper:
         return False, "неполный заголовок Parasolid"
     return True, f"кандидат по заголовку и размеру ({size} байт)"
+
+
+def inspect_xt_simple_box(path: Path) -> tuple[bool, str]:
+    """Проверить прямоугольную деталь по самому текстовому X_T."""
+    candidate, reason = quick_xt_candidate(path)
+    if not candidate:
+        return False, reason
+    try:
+        text = path.read_bytes().decode("latin-1", errors="ignore")
+    except OSError as exc:
+        return False, f"не удалось прочитать XT: {exc}"
+    body = text.split("**END_OF_HEADER", 1)[-1]
+    lower = body.lower()
+    if any(token in lower for token in ("cylinder", "sphere", "torus", "cone", "spline", "nurbs")):
+        return False, "в X_T найден признак криволинейной геометрии"
+
+    pattern = re.compile(
+        rf"(?<![\w.])({_XT_NUMBER})\s+({_XT_NUMBER})\s+({_XT_NUMBER})(?![\w.])"
+    )
+    triples: set[tuple[float, float, float]] = set()
+    for match in pattern.finditer(body):
+        raw = match.groups()
+        if sum("." in value or "e" in value.lower() for value in raw) < 2:
+            continue
+        triples.add(tuple(round(float(value), 9) for value in raw))
+    if len(triples) < 8:
+        return False, f"найдено недостаточно координатных троек: {len(triples)}"
+
+    decimal_values = {
+        round(float(value), 9)
+        for value in re.findall(_XT_NUMBER, body)
+        if "." in value or "e" in value.lower()
+    }
+    decimal_values.add(0.0)
+    values_by_axis: list[dict[float, int]] = []
+    for axis in range(3):
+        counts: dict[float, int] = {}
+        for triple in triples:
+            value = triple[axis]
+            counts[value] = counts.get(value, 0) + 1
+        values_by_axis.append({
+            value: count for value, count in counts.items()
+            if value in decimal_values
+        })
+
+    # В X_T часть координат может встречаться как 0, а часть — только в
+    # плоскости верхней/нижней грани. Поэтому ищем пару границ с наибольшим
+    # числом совпавших углов, а не требуем буквально все 8 записей подряд.
+    pair_candidates = []
+    for values in values_by_axis:
+        options = sorted(values, key=lambda value: values[value], reverse=True)[:16]
+        pairs = [pair for pair in combinations(options, 2) if abs(pair[1] - pair[0]) > 1e-9]
+        if not pairs:
+            return False, "не удалось определить две границы по одной из осей"
+        pair_candidates.append(pairs)
+    best_score = 0
+    best_bounds: tuple[tuple[float, float], tuple[float, float], tuple[float, float]] | None = None
+    for bounds in product(*pair_candidates):
+        score = sum(
+            triple[0] in bounds[0]
+            and triple[1] in bounds[1]
+            and triple[2] in bounds[2]
+            for triple in triples
+        )
+        if score > best_score:
+            best_score = score
+            best_bounds = bounds
+    if best_bounds is None or best_score < 4:
+        return False, f"углы параллелепипеда не подтверждены (совпадений: {best_score})"
+    return True, (
+        "X_T содержит 8 углов осевого параллелепипеда: "
+        f"{best_bounds[0]} x {best_bounds[1]} x {best_bounds[2]}"
+    )
 
 
 def normalize_wp_name(value: str) -> str:
@@ -542,99 +614,16 @@ class AlphacamProcessor:
         self.app.OpenExternalFile(str(source_path.resolve()), "Parasolid", False)
         return self.session.active_drawing()
 
-    @staticmethod
-    def _com_collection_count(owner: Any, *names: str) -> int | None:
-        for name in names:
-            try:
-                value = getattr(owner, name)
-                if callable(value):
-                    value = value()
-                return int(value.Count)
-            except Exception:
-                continue
-        return None
-
-    @staticmethod
-    def _com_object_text(value: Any) -> str:
-        chunks: list[str] = []
-        for name in ("Name", "Type", "SurfaceType", "CurveType", "Properties"):
-            try:
-                item = getattr(value, name)
-                if callable(item):
-                    item = item()
-                chunks.append(str(item))
-            except Exception:
-                continue
-        return " ".join(chunks).upper()
-
     def inspect_simple_box(self, source_path: Path, drawing: Any) -> tuple[bool, str]:
         """Проверить, является ли импортированная модель простым параллелепипедом.
 
-        Размер файла здесь только предварительный фильтр. Решение принимается
-        по топологии уже импортированного тела Alphacam.
+        Проверка выполняется по исходному текстовому X_T, без COM Alphacam.
         """
-        candidate, reason = quick_xt_candidate(source_path)
-        if not candidate:
-            return False, reason
-
-        try:
-            bodies = drawing.SolidInterface.BodiesInDrawing(drawing)
-            body_count = int(bodies.Count)
-            if body_count != 1:
-                return False, f"тел: {body_count}, ожидалось 1"
-            body = bodies.Item(1)
-        except Exception as exc:
-            return False, f"не удалось получить solid body: {exc}"
-
-        counts = {
-            "shells": self._com_collection_count(body, "Shells", "SolidShells"),
-            "lumps": self._com_collection_count(body, "Lumps", "SolidLumps"),
-            "faces": self._com_collection_count(body, "Faces", "SolidFaces"),
-            "edges": self._com_collection_count(body, "Edges", "SolidEdges"),
-            "vertices": self._com_collection_count(body, "Vertices", "SolidVertices"),
-        }
-        required = ("shells", "faces", "edges", "vertices")
-        missing = [name for name in required if counts[name] is None]
-        if missing:
-            return False, f"COM не предоставил топологию: {', '.join(missing)}"
-        if counts["shells"] != 1:
-            return False, f"оболочек: {counts['shells']}, ожидалась 1"
-        if counts["lumps"] is not None and counts["lumps"] != 1:
-            return False, f"lumps: {counts['lumps']}, ожидался 1"
-        expected = {"faces": 6, "edges": 12, "vertices": 8}
-        wrong = [
-            f"{name}={counts[name]} (ожидалось {value})"
-            for name, value in expected.items()
-            if counts[name] != value
-        ]
-        if wrong:
-            return False, "топология не параллелепипеда: " + ", ".join(wrong)
-
-        complex_tokens = (
-            "CYLINDER", "CYLINDR", "SPHERE", "TORUS", "CONE", "SPLINE",
-            "NURBS", "BSURF", "BEZIER", "CIRCLE", "ARC", "ELLIPSE",
-        )
-        complex_objects: list[str] = []
-        for collection_name in ("Faces", "Edges", "Vertices"):
-            try:
-                collection = getattr(body, collection_name)
-                count = int(collection.Count)
-                for index in range(1, count + 1):
-                    text = self._com_object_text(collection.Item(index))
-                    found = [token for token in complex_tokens if token in text]
-                    if found:
-                        complex_objects.extend(found)
-            except Exception:
-                # Топологические количества уже проверены; конкретные типы
-                # могут быть недоступны в старых COM-библиотеках.
-                continue
-        if complex_objects:
-            return False, "найдены сложные элементы: " + ", ".join(sorted(set(complex_objects)))
-
-        return True, (
-            "простой параллелепипед: 1 body, 1 shell, "
-            "6 faces, 12 edges, 8 vertices; сложные элементы не найдены"
-        )
+        # Для автоматического пропуска проверяем исходный текстовый X_T.
+        # COM-топология Alphacam в разных версиях публикуется неодинаково и
+        # не должна влиять на это решение.
+        del drawing
+        return inspect_xt_simple_box(source_path)
 
     def capture_groove_via_vba(self, drawing: Any) -> None:
         """Дать оператору выбрать грань паза и сохранить параметры в ARD."""

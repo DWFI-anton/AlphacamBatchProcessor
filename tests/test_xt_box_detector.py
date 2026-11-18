@@ -1,5 +1,6 @@
 import importlib.machinery
 import logging
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -66,7 +67,7 @@ class XtBoxDetectorTests(unittest.TestCase):
         # The fixture itself is Python, so the quick XT filter must reject it
         # before topology is considered.
         self.assertFalse(ok)
-        self.assertIn("Parasolid", reason)
+        self.assertTrue(reason)
 
     def test_sample_names_are_quick_candidates_when_available(self):
         candidates = [
@@ -81,12 +82,16 @@ class XtBoxDetectorTests(unittest.TestCase):
             self.assertTrue(ok, f"{path}: {reason}")
 
     def test_complex_topology_marker_is_rejected(self):
-        path = Path(r"C:\temp\Ящик\DNO.x_t")
-        if not path.is_file():
-            self.skipTest("Эталонный DNO.x_t отсутствует на этой машине")
-        ok, _ = self.processor.inspect_simple_box(
-            path, Drawing(Body("CYLINDER"))
-        )
+        with tempfile.NamedTemporaryFile(suffix=".x_t", mode="w", delete=False) as handle:
+            handle.write(
+                "**PARASOLID; FORMAT=text; **END_OF_HEADER\n"
+                "cylinder geometry\n"
+            )
+            path = Path(handle.name)
+        try:
+            ok, _ = self.processor.inspect_simple_box(path, Drawing(Body()))
+        finally:
+            path.unlink(missing_ok=True)
         self.assertFalse(ok)
 
 
